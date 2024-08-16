@@ -53,4 +53,5 @@ dependencies {
         exclude group: 'org.json', module: 'json'
     }
     implementation 'com.neovisionaries:nv-websocket-client:2.10'
+    implementation 'com.github.shenbengit:WebRTCExtension:1.1.0'
 }

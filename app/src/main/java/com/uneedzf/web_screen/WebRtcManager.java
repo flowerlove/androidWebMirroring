@@ -2,6 +2,8 @@ package com.uneedzf.web_screen;
 
 import android.content.Context;
 import android.content.Intent;
+import android.media.MediaCodecInfo;
+import android.media.MediaCodecList;
 import android.media.projection.MediaProjection;
 import android.util.Base64;
 import android.util.DisplayMetrics;
@@ -16,8 +18,10 @@ import org.json.JSONObject;
 import org.webrtc.AudioSource;
 import org.webrtc.AudioTrack;
 import org.webrtc.CameraEnumerator;
+import org.webrtc.CustomHardwareVideoEncoderFactory;
 import org.webrtc.DefaultVideoDecoderFactory;
 import org.webrtc.DefaultVideoEncoderFactory;
+import org.webrtc.DefaultVideoEncoderFactoryExtKt;
 import org.webrtc.EglBase;
 import org.webrtc.IceCandidate;
 import org.webrtc.Logging;
@@ -29,13 +33,16 @@ import org.webrtc.ScreenCapturerAndroid;
 import org.webrtc.SessionDescription;
 import org.webrtc.SurfaceTextureHelper;
 import org.webrtc.VideoCapturer;
+import org.webrtc.VideoEncoderSupportedCallback;
 import org.webrtc.VideoSource;
 import org.webrtc.VideoTrack;
 
 import java.io.IOException;
 import java.io.UnsupportedEncodingException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 import retrofit2.Call;
 import retrofit2.Callback;
@@ -46,22 +53,22 @@ import retrofit2.converter.gson.GsonConverterFactory;
 public class WebRtcManager {
     private static final String TAG = WebRtcManager.class.getSimpleName();
 
-    private static final boolean ENABLE_INTEL_VP8_ENCODER = true;
+    private static final boolean ENABLE_INTEL_VP8_ENCODER = false;
     private static final boolean ENABLE_H264_HIGH_PROFILE = true;
-    private static final int FRAMES_PER_SECOND = 24;
+    private static final int FRAMES_PER_SECOND = 30;
     private static final String SDP_PARAM = "sdp";
     private static final String ICE_PARAM = "ice";
 
-    private VideoCapturer videoCapturer;
+    private VideoCapturer videoCapturer = null;
     private EglBase rootEglBase;
     private PeerConnectionFactory peerConnectionFactory;
     private MediaConstraints audioConstraints;
     private MediaConstraints videoConstraints;
-    private VideoTrack localVideoTrack;
+    private VideoTrack localVideoTrack = null;
     private AudioSource audioSource;
     private AudioTrack localAudioTrack;
-    private PeerConnection localPeer = null;
-    private MediaConstraints sdpConstraints;
+    private Map<String, PeerConnection> peerConnectionMap;
+    private MediaConstraints sdpConstraints = null;
     private HttpServer server;
 
     List<PeerConnection.IceServer> peerIceServers = new ArrayList<>();
@@ -70,20 +77,21 @@ public class WebRtcManager {
     private Display display;
     private DisplayMetrics screenMetrics = new DisplayMetrics();
     private Thread rotationDetectorThread = null;
+    private MediaStream videoStream = null;
 
     public WebRtcManager(Intent intent, Context context, HttpServer server) {
         this.server = server;
         //XXX getIceServers();
         WindowManager wm = (WindowManager)context.getSystemService(Context.WINDOW_SERVICE);
         display = wm.getDefaultDisplay();
-
+        peerConnectionMap = new HashMap<>();
         createMediaProjection(intent);
         initWebRTC(context);
     }
 
-    public void close() {
-        stop();
-        stopRotationDetector();
+    public void destroy() {
+        stopAllWebRTCP2p();
+//        stopRotationDetector();
         destroyMediaProjection();
     }
 
@@ -122,11 +130,57 @@ public class WebRtcManager {
                 ENABLE_H264_HIGH_PROFILE);
         DefaultVideoDecoderFactory defaultVideoDecoderFactory = new
                 DefaultVideoDecoderFactory(rootEglBase.getEglBaseContext());
+
+        CustomHardwareVideoEncoderFactory customHardwareVideoEncoderFactory = new CustomHardwareVideoEncoderFactory(rootEglBase.getEglBaseContext(), ENABLE_INTEL_VP8_ENCODER,
+                ENABLE_H264_HIGH_PROFILE, new VideoEncoderSupportedCallback() {
+            @Override
+            public boolean isSupportedH264(@NonNull MediaCodecInfo info) {
+                String name = info.getName();
+                if(name.startsWith("OMX.rk"))
+                    return true;
+                else
+                    return false;
+            }
+
+            @Override
+            public boolean isSupportedVp8(@NonNull MediaCodecInfo info) {
+                return false;
+            }
+
+            @Override
+            public boolean isSupportedVp9(@NonNull MediaCodecInfo info) {
+                return false;
+            }
+        });
+
+        //use java
+//        DefaultVideoEncoderFactory encoderFactory = DefaultVideoEncoderFactoryExtKt.createCustomVideoEncoderFactory(rootEglBase.getEglBaseContext(), ENABLE_INTEL_VP8_ENCODER,
+//                ENABLE_H264_HIGH_PROFILE, new VideoEncoderSupportedCallback() {
+//            @Override
+//            public boolean isSupportedH264(@NonNull MediaCodecInfo info) {
+//                String name = info.getName();
+//                if(name.startsWith("OMX.rk"))
+//                    return true;
+//                else
+//                    return false;
+//            }
+//
+//            @Override
+//            public boolean isSupportedVp8(@NonNull MediaCodecInfo info) {
+//                return false;
+//            }
+//
+//            @Override
+//            public boolean isSupportedVp9(@NonNull MediaCodecInfo info) {
+//                return false;
+//            }
+//        });
+
         peerConnectionFactory = PeerConnectionFactory.builder()
-                .setOptions(options)
-                .setVideoEncoderFactory(defaultVideoEncoderFactory)
-                .setVideoDecoderFactory(defaultVideoDecoderFactory)
-                .createPeerConnectionFactory();
+        .setOptions(options)
+        .setVideoEncoderFactory(customHardwareVideoEncoderFactory)
+        .setVideoDecoderFactory(defaultVideoDecoderFactory)
+        .createPeerConnectionFactory();
 
         //XXX enable camera
         //videoCapturer = createCameraCapturer(new Camera1Enumerator(false));
@@ -139,6 +193,7 @@ public class WebRtcManager {
                 rootEglBase.getEglBaseContext());
         VideoSource videoSource =
                 peerConnectionFactory.createVideoSource(videoCapturer.isScreencast());
+        videoSource.adaptOutputFormat(1280, 720, 30);
         videoCapturer.initialize(surfaceTextureHelper, context, videoSource.getCapturerObserver());
 
         localVideoTrack = peerConnectionFactory.createVideoTrack("100", videoSource);
@@ -155,25 +210,41 @@ public class WebRtcManager {
         if (videoCapturer != null) {
             videoCapturer.startCapture(screenMetrics.widthPixels, screenMetrics.heightPixels,
                     FRAMES_PER_SECOND);
-            startRotationDetector();
+//            startRotationDetector();
         }
     }
 
-    public void start(HttpServer server) {
+    public void startWebRTCP2p(HttpServer server, String remoteIPAddress) {
         Log.d(TAG, "WebRTC start");
-        createPeerConnection();
-        doCall(server);
+        createPeerConnection(remoteIPAddress);
+        doCall(server, remoteIPAddress);
     }
 
-    public void stop() {
+    public void stopWebRTCP2p(String remoteIPAddress) {
         Log.d(TAG, "WebRTC stop");
-        if (localPeer == null)
+        if (remoteIPAddress == null || remoteIPAddress.isEmpty())
             return;
-        localPeer.close();
-        localPeer = null;
+
+        if(peerConnectionMap.containsKey(remoteIPAddress))
+        {
+            PeerConnection localPeer = peerConnectionMap.get(remoteIPAddress);
+            localPeer.close();
+            localPeer = null;
+            peerConnectionMap.remove(remoteIPAddress);
+        }
     }
 
-    private void createPeerConnection() {
+    public void stopAllWebRTCP2p() {
+        Log.d(TAG, "WebRTC stop ALL!");
+        for (PeerConnection localPeer: peerConnectionMap.values()) {
+            localPeer.close();
+            localPeer = null;
+        }
+
+        peerConnectionMap.clear();
+    }
+
+    private void createPeerConnection(String remoteIPAddress) {
         PeerConnection.RTCConfiguration rtcConfig =
                 new PeerConnection.RTCConfiguration(peerIceServers);
         // TCP candidates are only useful when connecting to a server that supports
@@ -184,12 +255,20 @@ public class WebRtcManager {
         rtcConfig.continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy
                 .GATHER_CONTINUALLY;
         rtcConfig.keyType = PeerConnection.KeyType.ECDSA;
-        localPeer = peerConnectionFactory.createPeerConnection(rtcConfig,
+
+        if(peerConnectionMap.containsKey(remoteIPAddress))
+        {
+            PeerConnection localPeer = peerConnectionMap.get(remoteIPAddress);
+            localPeer.close();
+            peerConnectionMap.remove(remoteIPAddress);
+        }
+
+        PeerConnection localPeer = peerConnectionFactory.createPeerConnection(rtcConfig,
                 new CustomPeerConnectionObserver("localPeerCreation") {
                     @Override
                     public void onIceCandidate(IceCandidate iceCandidate) {
                         super.onIceCandidate(iceCandidate);
-                        onIceCandidateReceived(iceCandidate);
+                        onIceCandidateReceived(iceCandidate, remoteIPAddress);
                     }
 
                     @Override
@@ -199,10 +278,19 @@ public class WebRtcManager {
                     }
                 });
 
-        addStreamToLocalPeer();
+        if(videoStream == null)
+        {
+            videoStream = peerConnectionFactory.createLocalMediaStream("102");
+            videoStream.addTrack(localVideoTrack);
+        }
+        //TODO stream.addTrack(localAudioTrack); stiller
+        //stream.addTrack(localAudioTrack);
+        localPeer.addStream(videoStream);
+
+        peerConnectionMap.put(remoteIPAddress, localPeer);
     }
 
-    public void onIceCandidateReceived(IceCandidate iceCandidate) {
+    public void onIceCandidateReceived(IceCandidate iceCandidate, String remoteIPAddress) {
         JSONObject messageJson = new JSONObject();
         JSONObject iceJson = new JSONObject();
         try {
@@ -216,7 +304,7 @@ public class WebRtcManager {
 
             String messageJsonStr = messageJson.toString();
             //XXX broadcast
-            server.send(messageJson.toString());
+            server.send(messageJson.toString(), remoteIPAddress);
             Log.d(TAG, "Send ICE candidates: " + messageJsonStr);
         } catch (Exception e) {
             e.printStackTrace();
@@ -225,54 +313,54 @@ public class WebRtcManager {
     }
 
     private void addStreamToLocalPeer() {
-        MediaStream stream = peerConnectionFactory.createLocalMediaStream("102");
-        //TODO stream.addTrack(localAudioTrack); stiller
-//        stream.addTrack(localAudioTrack);
 
-
-        stream.addTrack(localVideoTrack);
-        localPeer.addStream(stream);
     }
 
-    private void doCall(HttpServer server) {
+    private void doCall(HttpServer server, String remoteIPAddress) {
         sdpConstraints = new MediaConstraints();
-        //TODO sdpConstraints.mandatory.add(
-        //        new MediaConstraints.KeyValuePair("OfferToReceiveAudio", "true"));
         sdpConstraints.mandatory.add(
                 new MediaConstraints.KeyValuePair("OfferToReceiveVideo", "true"));
-        localPeer.createOffer(new CustomSdpObserver("localCreateOffer") {
-            @Override
-            public void onCreateSuccess(SessionDescription sessionDescription) {
-                super.onCreateSuccess(sessionDescription);
-                localPeer.setLocalDescription(new CustomSdpObserver("localSetLocalDesc"),
-                        sessionDescription);
+        //TODO sdpConstraints.mandatory.add(
+        //        new MediaConstraints.KeyValuePair("OfferToReceiveAudio", "true"));
 
-                JSONObject messageJson = new JSONObject();
-                JSONObject sdpJson = new JSONObject();
-                try {
-                    sdpJson.put("type", sessionDescription.type.canonicalForm());
-                    sdpJson.put("sdp", sessionDescription.description);
+        if(peerConnectionMap.containsKey(remoteIPAddress))
+        {
+            PeerConnection localPeer = peerConnectionMap.get(remoteIPAddress);
 
-                    messageJson.put("type", "sdp");
-                    messageJson.put("sdp", sdpJson);
-                } catch (JSONException e) {
-                    e.printStackTrace();
-                    return;
+            localPeer.createOffer(new CustomSdpObserver("localCreateOffer") {
+                @Override
+                public void onCreateSuccess(SessionDescription sessionDescription) {
+                    super.onCreateSuccess(sessionDescription);
+                    localPeer.setLocalDescription(new CustomSdpObserver("localSetLocalDesc"),
+                            sessionDescription);
+
+                    JSONObject messageJson = new JSONObject();
+                    JSONObject sdpJson = new JSONObject();
+                    try {
+                        sdpJson.put("type", sessionDescription.type.canonicalForm());
+                        sdpJson.put("sdp", sessionDescription.description);
+
+                        messageJson.put("type", "sdp");
+                        messageJson.put("sdp", sdpJson);
+                    } catch (JSONException e) {
+                        e.printStackTrace();
+                        return;
+                    }
+
+                    String messageJsonStr = messageJson.toString();
+                    try {
+                        server.send(messageJsonStr, remoteIPAddress);
+                    } catch (IOException e) {
+                        e.printStackTrace();
+                        return;
+                    }
+                    Log.d(TAG, "Send SDP: " + messageJsonStr);
                 }
-
-                String messageJsonStr = messageJson.toString();
-                try {
-                    server.send(messageJsonStr);
-                } catch (IOException e) {
-                    e.printStackTrace();
-                    return;
-                }
-                Log.d(TAG, "Send SDP: " + messageJsonStr);
-            }
-        }, sdpConstraints);
+            }, sdpConstraints);
+        }
     }
 
-    public void onAnswerReceived(JSONObject data) {
+    public void onAnswerReceived(JSONObject data, String remoteIPAddress) {
         JSONObject json;
         try {
             json = data.getJSONObject(SDP_PARAM);
@@ -284,15 +372,20 @@ public class WebRtcManager {
         Log.d(TAG, "Remote SDP received: " + json.toString());
 
         try {
-            localPeer.setRemoteDescription(new CustomSdpObserver("localSetRemote"),
-                    new SessionDescription(SessionDescription.Type.fromCanonicalForm(json.getString(
-                            "type").toLowerCase()), json.getString("sdp")));
+
+            if(peerConnectionMap.containsKey(remoteIPAddress))
+            {
+                PeerConnection localPeer = peerConnectionMap.get(remoteIPAddress);
+                localPeer.setRemoteDescription(new CustomSdpObserver("localSetRemote"),
+                        new SessionDescription(SessionDescription.Type.fromCanonicalForm(json.getString(
+                                "type").toLowerCase()), json.getString("sdp")));
+            }
         } catch (JSONException e) {
             e.printStackTrace();
         }
     }
 
-    public void onIceCandidateReceived(JSONObject data) {
+    public void onIceCandidateReceived(JSONObject data, String remoteIPAddress) {
         JSONObject json;
         try {
             json = data.getJSONObject(ICE_PARAM);
@@ -303,142 +396,147 @@ public class WebRtcManager {
         Log.d(TAG, "ICE candidate received: " + json.toString());
 
         try {
-            localPeer.addIceCandidate(new IceCandidate(json.getString("id"), json.getInt("label"),
-                    json.getString("candidate")));
+            if(peerConnectionMap.containsKey(remoteIPAddress))
+            {
+                PeerConnection localPeer = peerConnectionMap.get(remoteIPAddress);
+                localPeer.addIceCandidate(new IceCandidate(json.getString("id"), json.getInt("label"),
+                        json.getString("candidate")));
+            }
+
         } catch (JSONException e) {
             e.printStackTrace();
         }
     }
 
-    private VideoCapturer createCameraCapturer(CameraEnumerator enumerator) {
-        Log.d(TAG, new Object(){}.getClass().getEnclosingMethod().getName());
-        final String[] deviceNames = enumerator.getDeviceNames();
+//    private VideoCapturer createCameraCapturer(CameraEnumerator enumerator) {
+//        Log.d(TAG, new Object(){}.getClass().getEnclosingMethod().getName());
+//        final String[] deviceNames = enumerator.getDeviceNames();
+//
+//        // First, try to find front facing camera
+//        Logging.d(TAG, "Looking for front facing cameras.");
+//        for (String deviceName : deviceNames) {
+//            if (enumerator.isFrontFacing(deviceName)) {
+//                Logging.d(TAG, "Creating front facing camera capturer.");
+//                VideoCapturer videoCapturer = enumerator.createCapturer(deviceName, null);
+//
+//                if (videoCapturer != null) {
+//                    return videoCapturer;
+//                }
+//            }
+//        }
+//
+//        // Front facing camera not found, try something else
+//        Logging.d(TAG, "Looking for other cameras.");
+//        for (String deviceName : deviceNames) {
+//            if (!enumerator.isFrontFacing(deviceName)) {
+//                Logging.d(TAG, "Creating other camera capturer.");
+//                VideoCapturer videoCapturer = enumerator.createCapturer(deviceName, null);
+//
+//                if (videoCapturer != null) {
+//                    return videoCapturer;
+//                }
+//            }
+//        }
+//
+//        return null;
+//    }
+//
+//    public void getIceServers() {
+//        final String API_ENDPOINT = "https://global.xirsys.net";
+//
+//        Log.d(TAG, "getIceServers");
+//
+//        byte[] data = new byte[0];
+//        try {
+//            data = ("<xirsys_ident>:<xirsys_secret>").getBytes("UTF-8");
+//        } catch (UnsupportedEncodingException e) {
+//            e.printStackTrace();
+//            return;
+//        }
+//        Log.d(TAG, "getIceServers2");
+//
+//        String authToken = "Basic " + Base64.encodeToString(data, Base64.NO_WRAP);
+//        Retrofit retrofit = new Retrofit.Builder()
+//                .baseUrl(API_ENDPOINT)
+//                .addConverterFactory(GsonConverterFactory.create())
+//                .build();
+//        Log.d(TAG, "getIceServers3");
+//        TurnServer turnServer = retrofit.create(TurnServer.class);
+//        Log.d(TAG, "getIceServers4");
+//        turnServer.getIceCandidates(authToken).enqueue(new Callback<TurnServerPojo>() {
+//            @Override
+//            public void onResponse(@NonNull Call<TurnServerPojo> call,
+//                                   @NonNull Response<TurnServerPojo> response) {
+//                Log.d(TAG, "getIceServers Response");
+//                TurnServerPojo body = response.body();
+//                if (body != null)
+//                    iceServers = body.iceServerList.iceServers;
+//
+//                Log.d(TAG, "getIceServers iceServers=" + iceServers);
+//
+//                for (IceServer iceServer : iceServers) {
+//                    if (iceServer.credential == null) {
+//                        PeerConnection.IceServer peerIceServer = PeerConnection.IceServer
+//                                .builder(iceServer.url).createIceServer();
+//                        peerIceServers.add(peerIceServer);
+//                    } else {
+//                        PeerConnection.IceServer peerIceServer = PeerConnection.IceServer
+//                                .builder(iceServer.url)
+//                                .setUsername(iceServer.username)
+//                                .setPassword(iceServer.credential)
+//                                .createIceServer();
+//                        peerIceServers.add(peerIceServer);
+//                    }
+//                }
+//                Log.d(TAG, "IceServers:\n" + iceServers.toString());
+//            }
+//
+//            @Override
+//            public void onFailure(@NonNull Call<TurnServerPojo> call, @NonNull Throwable t) {
+//                t.printStackTrace();
+//            }
+//        });
+//    }
 
-        // First, try to find front facing camera
-        Logging.d(TAG, "Looking for front facing cameras.");
-        for (String deviceName : deviceNames) {
-            if (enumerator.isFrontFacing(deviceName)) {
-                Logging.d(TAG, "Creating front facing camera capturer.");
-                VideoCapturer videoCapturer = enumerator.createCapturer(deviceName, null);
-
-                if (videoCapturer != null) {
-                    return videoCapturer;
-                }
-            }
-        }
-
-        // Front facing camera not found, try something else
-        Logging.d(TAG, "Looking for other cameras.");
-        for (String deviceName : deviceNames) {
-            if (!enumerator.isFrontFacing(deviceName)) {
-                Logging.d(TAG, "Creating other camera capturer.");
-                VideoCapturer videoCapturer = enumerator.createCapturer(deviceName, null);
-
-                if (videoCapturer != null) {
-                    return videoCapturer;
-                }
-            }
-        }
-
-        return null;
-    }
-
-    public void getIceServers() {
-        final String API_ENDPOINT = "https://global.xirsys.net";
-
-        Log.d(TAG, "getIceServers");
-
-        byte[] data = new byte[0];
-        try {
-            data = ("<xirsys_ident>:<xirsys_secret>").getBytes("UTF-8");
-        } catch (UnsupportedEncodingException e) {
-            e.printStackTrace();
-            return;
-        }
-        Log.d(TAG, "getIceServers2");
-
-        String authToken = "Basic " + Base64.encodeToString(data, Base64.NO_WRAP);
-        Retrofit retrofit = new Retrofit.Builder()
-                .baseUrl(API_ENDPOINT)
-                .addConverterFactory(GsonConverterFactory.create())
-                .build();
-        Log.d(TAG, "getIceServers3");
-        TurnServer turnServer = retrofit.create(TurnServer.class);
-        Log.d(TAG, "getIceServers4");
-        turnServer.getIceCandidates(authToken).enqueue(new Callback<TurnServerPojo>() {
-            @Override
-            public void onResponse(@NonNull Call<TurnServerPojo> call,
-                                   @NonNull Response<TurnServerPojo> response) {
-                Log.d(TAG, "getIceServers Response");
-                TurnServerPojo body = response.body();
-                if (body != null)
-                    iceServers = body.iceServerList.iceServers;
-
-                Log.d(TAG, "getIceServers iceServers=" + iceServers);
-
-                for (IceServer iceServer : iceServers) {
-                    if (iceServer.credential == null) {
-                        PeerConnection.IceServer peerIceServer = PeerConnection.IceServer
-                                .builder(iceServer.url).createIceServer();
-                        peerIceServers.add(peerIceServer);
-                    } else {
-                        PeerConnection.IceServer peerIceServer = PeerConnection.IceServer
-                                .builder(iceServer.url)
-                                .setUsername(iceServer.username)
-                                .setPassword(iceServer.credential)
-                                .createIceServer();
-                        peerIceServers.add(peerIceServer);
-                    }
-                }
-                Log.d(TAG, "IceServers:\n" + iceServers.toString());
-            }
-
-            @Override
-            public void onFailure(@NonNull Call<TurnServerPojo> call, @NonNull Throwable t) {
-                t.printStackTrace();
-            }
-        });
-    }
-
-    private void startRotationDetector() {
-        Runnable runnable = new Runnable() {
-            @Override
-            public void run() {
-                Log.d(TAG, "Rotation detector start");
-                display.getRealMetrics(screenMetrics);
-                while (true) {
-                    DisplayMetrics metrics = new DisplayMetrics();
-                    display.getRealMetrics(metrics);
-                    if (metrics.widthPixels != screenMetrics.widthPixels ||
-                            metrics.heightPixels != screenMetrics.heightPixels) {
-                        Log.d(TAG, "Rotation detected\n" + "w=" + metrics.widthPixels + " h=" +
-                                metrics.heightPixels + " d=" + metrics.densityDpi);
-                        screenMetrics = metrics;
-                        if (videoCapturer != null) {
-                            try {
-                                videoCapturer.stopCapture();
-                            } catch (Exception e) {
-                                e.printStackTrace();
-                            }
-                            videoCapturer.startCapture(screenMetrics.widthPixels,
-                                    screenMetrics.heightPixels, FRAMES_PER_SECOND);
-                        }
-                    }
-                    try {
-                        Thread.sleep(500);
-                    } catch (InterruptedException e) {
-                        Log.d(TAG, "Rotation detector exit");
-                        Thread.interrupted();
-                        break;
-                    }
-                }
-            }
-        };
-        rotationDetectorThread = new Thread(runnable);
-        rotationDetectorThread.start();
-    }
-
-    private void stopRotationDetector() {
-        rotationDetectorThread.interrupt();
-    }
+//    private void startRotationDetector() {
+//        Runnable runnable = new Runnable() {
+//            @Override
+//            public void run() {
+//                Log.d(TAG, "Rotation detector start");
+//                display.getRealMetrics(screenMetrics);
+//                while (true) {
+//                    DisplayMetrics metrics = new DisplayMetrics();
+//                    display.getRealMetrics(metrics);
+//                    if (metrics.widthPixels != screenMetrics.widthPixels ||
+//                            metrics.heightPixels != screenMetrics.heightPixels) {
+//                        Log.d(TAG, "Rotation detected\n" + "w=" + metrics.widthPixels + " h=" +
+//                                metrics.heightPixels + " d=" + metrics.densityDpi);
+//                        screenMetrics = metrics;
+//                        if (videoCapturer != null) {
+//                            try {
+//                                videoCapturer.stopCapture();
+//                            } catch (Exception e) {
+//                                e.printStackTrace();
+//                            }
+//                            videoCapturer.startCapture(screenMetrics.widthPixels,
+//                                    screenMetrics.heightPixels, FRAMES_PER_SECOND);
+//                        }
+//                    }
+//                    try {
+//                        Thread.sleep(1000);
+//                    } catch (InterruptedException e) {
+//                        Log.d(TAG, "Rotation detector exit");
+//                        Thread.interrupted();
+//                        break;
+//                    }
+//                }
+//            }
+//        };
+//        rotationDetectorThread = new Thread(runnable);
+//        rotationDetectorThread.start();
+//    }
+//
+//    private void stopRotationDetector() {
+//        rotationDetectorThread.interrupt();
+//    }
  }

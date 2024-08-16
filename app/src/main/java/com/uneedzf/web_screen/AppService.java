@@ -134,7 +134,7 @@ public class AppService extends Service {
         accessibilityServiceSet(null, false);
 
         stopHttpServer();
-        webRtcManager.close();
+        webRtcManager.destroy();
         webRtcManager = null;
     }
 
@@ -191,103 +191,103 @@ public class AppService extends Service {
     private HttpServer.HttpServerInterface httpServerInterface = new
             HttpServer.HttpServerInterface() {
                 @Override
-                public void onMouseDown(JSONObject message) {
+                public void onMouseDown(JSONObject message, String remoteIPAddress) {
                     int[] coordinates = getCoordinates(message);
                     if (coordinates != null && mouseAccessibilityService != null)
                         mouseAccessibilityService.mouseDown(coordinates[0], coordinates[1]);
                 }
 
                 @Override
-                public void onMouseMove(JSONObject message) {
+                public void onMouseMove(JSONObject message, String remoteIPAddress) {
                     int[] coordinates = getCoordinates(message);
                     if (coordinates != null && mouseAccessibilityService != null)
                         mouseAccessibilityService.mouseMove(coordinates[0], coordinates[1]);
                 }
 
                 @Override
-                public void onMouseUp(JSONObject message) {
+                public void onMouseUp(JSONObject message, String remoteIPAddress) {
                     int[] coordinates = getCoordinates(message);
                     if (coordinates != null && mouseAccessibilityService != null)
                         mouseAccessibilityService.mouseUp(coordinates[0], coordinates[1]);
                 }
 
                 @Override
-                public void onMouseZoomIn(JSONObject message) {
+                public void onMouseZoomIn(JSONObject message, String remoteIPAddress) {
                     int[] coordinates = getCoordinates(message);
                     if (coordinates != null && mouseAccessibilityService != null)
                         mouseAccessibilityService.mouseWheelZoomIn(coordinates[0], coordinates[1]);
                 }
 
                 @Override
-                public void onMouseZoomOut(JSONObject message) {
+                public void onMouseZoomOut(JSONObject message, String remoteIPAddress) {
                     int[] coordinates = getCoordinates(message);
                     if (coordinates != null && mouseAccessibilityService != null)
                         mouseAccessibilityService.mouseWheelZoomOut(coordinates[0], coordinates[1]);
                 }
 
                 @Override
-                public void onButtonBack() {
+                public void onButtonBack(String remoteIPAddress) {
                     if (mouseAccessibilityService != null)
                         mouseAccessibilityService.backButtonClick();
                 }
 
                 @Override
-                public void onButtonHome() {
+                public void onButtonHome(String remoteIPAddress) {
                     if (mouseAccessibilityService != null)
                         mouseAccessibilityService.homeButtonClick();
                 }
 
                 @Override
-                public void onButtonRecent() {
+                public void onButtonRecent(String remoteIPAddress) {
                     if (mouseAccessibilityService != null)
                         mouseAccessibilityService.recentButtonClick();
                 }
 
                 @Override
-                public void onButtonPower() {
+                public void onButtonPower(String remoteIPAddress) {
                     if (mouseAccessibilityService != null)
                         mouseAccessibilityService.powerButtonClick();
                 }
 
                 @Override
-                public void onButtonLock() {
+                public void onButtonLock(String remoteIPAddress) {
                     if (mouseAccessibilityService != null)
                         mouseAccessibilityService.lockButtonClick();
                 }
 
                 @Override
-                public void onJoin(HttpServer server) {
+                public void onJoin(HttpServer server, String remoteIPAddress) {
                     if (webRtcManager == null)
                         return;
-                    webRtcManager.start(server);
+                    webRtcManager.startWebRTCP2p(server, remoteIPAddress);
                 }
 
                 @Override
-                public void onSdp(JSONObject message) {
+                public void onSdp(JSONObject message, String remoteIPAddress) {
                     if (webRtcManager == null)
                         return;
-                    webRtcManager.onAnswerReceived(message);
+                    webRtcManager.onAnswerReceived(message, remoteIPAddress);
                 }
 
                 @Override
-                public void onIceCandidate(JSONObject message) {
+                public void onIceCandidate(JSONObject message, String remoteIPAddress) {
                     if (webRtcManager == null)
                         return;
-                    webRtcManager.onIceCandidateReceived(message);
+                    webRtcManager.onIceCandidateReceived(message, remoteIPAddress);
                 }
 
                 @Override
-                public void onBye() {
+                public void onBye(String remoteIPAddress) {
                     if (webRtcManager == null)
                         return;
-                    webRtcManager.stop();
+                    webRtcManager.stopWebRTCP2p(remoteIPAddress);
                 }
 
                 @Override
-                public void onWebSocketClose() {
+                public void onWebSocketClose(String remoteIPAddress) {
                     if (webRtcManager == null)
                         return;
-                    webRtcManager.stop();
+                    webRtcManager.stopWebRTCP2p(remoteIPAddress);
                 }
     };
 

@@ -76,6 +76,8 @@ public abstract class NanoWSD extends NanoHTTPD {
 
         private final NanoHTTPD.IHTTPSession handshakeRequest;
 
+        private String remoteIPAddres = null;
+
         private final NanoHTTPD.Response handshakeResponse = new NanoHTTPD.Response(NanoHTTPD.Response.Status.SWITCH_PROTOCOL, null, (InputStream) null, 0) {
 
             @Override
@@ -84,7 +86,7 @@ public abstract class NanoWSD extends NanoHTTPD {
                 WebSocket.this.state = State.CONNECTING;
                 super.send(out);
                 WebSocket.this.state = State.OPEN;
-                WebSocket.this.onOpen();
+                WebSocket.this.onOpen(remoteIPAddres);
                 readWebsocket();
             }
         };
@@ -92,7 +94,7 @@ public abstract class NanoWSD extends NanoHTTPD {
         public WebSocket(NanoHTTPD.IHTTPSession handshakeRequest) {
             this.handshakeRequest = handshakeRequest;
             this.in = handshakeRequest.getInputStream();
-
+            this.remoteIPAddres = handshakeRequest.getRemoteIpAddress();
             this.handshakeResponse.addHeader(NanoWSD.HEADER_UPGRADE, NanoWSD.HEADER_UPGRADE_VALUE);
             this.handshakeResponse.addHeader(NanoWSD.HEADER_CONNECTION, NanoWSD.HEADER_CONNECTION_VALUE);
         }
@@ -101,13 +103,15 @@ public abstract class NanoWSD extends NanoHTTPD {
             return state == State.OPEN;
         }
 
-        protected abstract void onOpen();
+        protected abstract void onOpen(String remoteIPAddress);
 
-        protected abstract void onClose(CloseCode code, String reason, boolean initiatedByRemote);
+        protected abstract void stopTimer(String remoteIPAddress);
 
-        protected abstract void onMessage(WebSocketFrame message);
+        protected abstract void onClose(CloseCode code, String reason, boolean initiatedByRemote, String remoteIPAddress);
 
-        protected abstract void onPong(WebSocketFrame pong);
+        protected abstract void onMessage(WebSocketFrame message, String remoteIPAddress);
+
+        protected abstract void onPong(WebSocketFrame pong, String remoteIPAddress);
 
         protected abstract void onException(IOException exception);
 
@@ -130,17 +134,17 @@ public abstract class NanoWSD extends NanoHTTPD {
         protected void debugFrameSent(WebSocketFrame frame) {
         }
 
-        public void close(CloseCode code, String reason, boolean initiatedByRemote) throws IOException {
+        public void close(CloseCode code, String reason, boolean initiatedByRemote, String remoteIPAddress, boolean force) throws IOException {
             State oldState = this.state;
             this.state = State.CLOSING;
-            if (oldState == State.OPEN) {
+            if (oldState == State.OPEN && !force) {
                 sendFrame(new CloseFrame(code, reason));
             } else {
-                doClose(code, reason, initiatedByRemote);
+                doClose(code, reason, initiatedByRemote, remoteIPAddress);
             }
         }
 
-        private void doClose(CloseCode code, String reason, boolean initiatedByRemote) {
+        private void doClose(CloseCode code, String reason, boolean initiatedByRemote, String remoteIPAddress) {
             if (this.state == State.CLOSED) {
                 return;
             }
@@ -159,7 +163,7 @@ public abstract class NanoWSD extends NanoHTTPD {
                 }
             }
             this.state = State.CLOSED;
-            onClose(code, reason, initiatedByRemote);
+            onClose(code, reason, initiatedByRemote, remoteIPAddress);
         }
 
         // --------------------------------IO--------------------------------------
@@ -172,7 +176,7 @@ public abstract class NanoWSD extends NanoHTTPD {
             return this.handshakeResponse;
         }
 
-        private void handleCloseFrame(WebSocketFrame frame) throws IOException {
+        private void handleCloseFrame(WebSocketFrame frame, String remoteIPAddress) throws IOException {
             CloseCode code = CloseCode.NormalClosure;
             String reason = "";
             if (frame instanceof CloseFrame) {
@@ -181,13 +185,13 @@ public abstract class NanoWSD extends NanoHTTPD {
             }
             if (this.state == State.CLOSING) {
                 // Answer for my requested close
-                doClose(code, reason, false);
+                doClose(code, reason, false, remoteIPAddress);
             } else {
-                close(code, reason, true);
+                close(code, reason, true, remoteIPAddress, false);
             }
         }
 
-        private void handleFrameFragment(WebSocketFrame frame) throws IOException {
+        private void handleFrameFragment(WebSocketFrame frame, String remoteIPAddres) throws IOException {
             if (frame.getOpCode() != OpCode.Continuation) {
                 // First
                 if (this.continuousOpCode != null) {
@@ -202,7 +206,7 @@ public abstract class NanoWSD extends NanoHTTPD {
                     throw new WebSocketException(CloseCode.ProtocolError, "Continuous frame sequence was not started.");
                 }
                 this.continuousFrames.add(frame);
-                onMessage(new WebSocketFrame(this.continuousOpCode, this.continuousFrames));
+                onMessage(new WebSocketFrame(this.continuousOpCode, this.continuousFrames), remoteIPAddres);
                 this.continuousOpCode = null;
                 this.continuousFrames.clear();
             } else if (this.continuousOpCode == null) {
@@ -214,20 +218,20 @@ public abstract class NanoWSD extends NanoHTTPD {
             }
         }
 
-        private void handleWebsocketFrame(WebSocketFrame frame) throws IOException {
+        private void handleWebsocketFrame(WebSocketFrame frame, String remoteIPAddress) throws IOException {
             debugFrameReceived(frame);
             if (frame.getOpCode() == OpCode.Close) {
-                handleCloseFrame(frame);
+                handleCloseFrame(frame, remoteIPAddress);
             } else if (frame.getOpCode() == OpCode.Ping) {
                 sendFrame(new WebSocketFrame(OpCode.Pong, true, frame.getBinaryPayload()));
             } else if (frame.getOpCode() == OpCode.Pong) {
-                onPong(frame);
+                onPong(frame, remoteIPAddress);
             } else if (!frame.isFin() || frame.getOpCode() == OpCode.Continuation) {
-                handleFrameFragment(frame);
+                handleFrameFragment(frame, remoteIPAddres);
             } else if (this.continuousOpCode != null) {
                 throw new WebSocketException(CloseCode.ProtocolError, "Continuous frame sequence not completed.");
             } else if (frame.getOpCode() == OpCode.Text || frame.getOpCode() == OpCode.Binary) {
-                onMessage(frame);
+                onMessage(frame, remoteIPAddress);
             } else {
                 throw new WebSocketException(CloseCode.ProtocolError, "Non control or continuous frame expected.");
             }
@@ -245,23 +249,24 @@ public abstract class NanoWSD extends NanoHTTPD {
         private void readWebsocket() {
             try {
                 while (this.state == State.OPEN) {
-                    handleWebsocketFrame(WebSocketFrame.read(this.in));
+                    handleWebsocketFrame(WebSocketFrame.read(this.in, this.remoteIPAddres), this.remoteIPAddres);
                 }
             } catch (CharacterCodingException e) {
                 onException(e);
-                doClose(CloseCode.InvalidFramePayloadData, e.toString(), false);
+                doClose(CloseCode.InvalidFramePayloadData, e.toString(), false, this.remoteIPAddres);
             } catch (IOException e) {
                 onException(e);
                 if (e instanceof WebSocketException) {
-                    doClose(((WebSocketException) e).getCode(), ((WebSocketException) e).getReason(), false);
+                    doClose(((WebSocketException) e).getCode(), ((WebSocketException) e).getReason(), false, this.remoteIPAddres);
                 }
             } finally {
-                doClose(CloseCode.InternalServerError, "Handler terminated without closing the connection.", false);
+                doClose(CloseCode.InternalServerError, "Handler terminated without closing the connection.", false, this.remoteIPAddres);
             }
         }
 
         public void send(byte[] payload) throws IOException {
-            sendFrame(new WebSocketFrame(OpCode.Binary, true, payload));
+            if(this.state == State.OPEN)
+                sendFrame(new WebSocketFrame(OpCode.Binary, true, payload));
         }
 
         public void send(String payload) throws IOException {
@@ -270,7 +275,7 @@ public abstract class NanoWSD extends NanoHTTPD {
 
         public synchronized void sendFrame(WebSocketFrame frame) throws IOException {
             debugFrameSent(frame);
-            frame.write(this.out);
+            frame.write(this.out, this.remoteIPAddres);
         }
     }
 
@@ -431,7 +436,7 @@ public abstract class NanoWSD extends NanoHTTPD {
             return read;
         }
 
-        public static WebSocketFrame read(InputStream in) throws IOException {
+        public static WebSocketFrame read(InputStream in, String remoteIPAddress) throws IOException {
             byte head = (byte) checkedRead(in.read());
             boolean fin = (head & 0x80) != 0;
             OpCode opCode = OpCode.find((byte) (head & 0x0F));
@@ -445,8 +450,8 @@ public abstract class NanoWSD extends NanoHTTPD {
             }
 
             WebSocketFrame frame = new WebSocketFrame(opCode, fin);
-            frame.readPayloadInfo(in);
-            frame.readPayload(in);
+            frame.readPayloadInfo(in,remoteIPAddress);
+            frame.readPayload(in,remoteIPAddress);
             if (frame.getOpCode() == OpCode.Close) {
                 return new CloseFrame(frame);
             } else {
@@ -466,11 +471,15 @@ public abstract class NanoWSD extends NanoHTTPD {
 
         private byte[] payload;
 
+        private String remoteIPAddress;
         // --------------------------------GETTERS---------------------------------
 
         private transient int _payloadLength;
 
         private transient String _payloadString;
+
+
+
 
         private WebSocketFrame(OpCode opCode, boolean fin) {
             setOpCode(opCode);
@@ -537,6 +546,9 @@ public abstract class NanoWSD extends NanoHTTPD {
             return this.opCode;
         }
 
+        public String getRemoteIPAddress() {
+            return this.remoteIPAddress;
+        }
         // --------------------------------SERIALIZATION---------------------------
 
         public String getTextPayload() {
@@ -584,7 +596,7 @@ public abstract class NanoWSD extends NanoHTTPD {
             }
         }
 
-        private void readPayload(InputStream in) throws IOException {
+        private void readPayload(InputStream in, String remoteIPAddress) throws IOException {
             this.payload = new byte[this._payloadLength];
             int read = 0;
             while (read < this._payloadLength) {
@@ -605,7 +617,7 @@ public abstract class NanoWSD extends NanoHTTPD {
 
         // --------------------------------ENCODING--------------------------------
 
-        private void readPayloadInfo(InputStream in) throws IOException {
+        private void readPayloadInfo(InputStream in, String remoteIPAddress) throws IOException {
             byte b = (byte) checkedRead(in.read());
             boolean masked = (b & 0x80) != 0;
 
@@ -668,6 +680,10 @@ public abstract class NanoWSD extends NanoHTTPD {
             this.opCode = opcode;
         }
 
+        public void setRemoteIPAddress(String ipAddress) {
+            this.remoteIPAddress = ipAddress;
+        }
+
         public void setTextPayload(String payload) throws CharacterCodingException {
             this.payload = text2Binary(payload);
             this._payloadLength = payload.length();
@@ -693,7 +709,7 @@ public abstract class NanoWSD extends NanoHTTPD {
 
         // ------------------------------------------------------------------------
 
-        public void write(OutputStream out) throws IOException {
+        public void write(OutputStream out, String remoteIPAddress) throws IOException {
             byte header = 0;
             if (this.fin) {
                 header |= 0x80;

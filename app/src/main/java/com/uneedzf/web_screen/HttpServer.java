@@ -13,8 +13,11 @@ import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.lang.reflect.Array;
 import java.security.KeyStore;
 import java.security.KeyStoreException;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Timer;
 import java.util.TimerTask;
 
@@ -48,13 +51,14 @@ public class HttpServer extends NanoWSD {
     private static final String TYPE_VALUE_BYE = "bye";
 
     private Context context;
-    Ws webSocket = null;
+    private Map<String, Ws> webSocketMap;
 
     private HttpServer.HttpServerInterface httpServerInterface;
 
     public HttpServer(int port, Context context,
                       HttpServer.HttpServerInterface httpServerInterface) {
         super(port);
+        webSocketMap = new HashMap<>();
         this.context = context;
         this.httpServerInterface = httpServerInterface;
         configSecurity();
@@ -87,13 +91,13 @@ public class HttpServer extends NanoWSD {
         }
 
         @Override
-        protected void onOpen() {
+        protected void onOpen(String remoteIPAddress) {
             Log.d(TAG, "WebSocket open");
             TimerTask timerTask = new TimerTask() {
                 @Override
                 public void run() {
                     try {
-                        Ws.this.ping(new byte[0]);
+                            Ws.this.ping(new byte[0]);
                     } catch (IOException e) {
                         e.printStackTrace();
                     }
@@ -104,15 +108,21 @@ public class HttpServer extends NanoWSD {
         }
 
         @Override
-        protected void onClose(WebSocketFrame.CloseCode code, String reason,
-                               boolean initiatedByRemote) {
-            Log.d(TAG, "WebSocket close");
+        protected void stopTimer(String remoteIPAddress) {
+            Log.d(TAG, "WebSocket open");
             pingTimer.cancel();
-            httpServerInterface.onWebSocketClose();
         }
 
         @Override
-        protected void onMessage(WebSocketFrame message) {
+        protected void onClose(WebSocketFrame.CloseCode code, String reason,
+                               boolean initiatedByRemote, String remoteIPAddress) {
+            Log.d(TAG, "WebSocket close");
+            pingTimer.cancel();
+            httpServerInterface.onWebSocketClose(remoteIPAddress);
+        }
+
+        @Override
+        protected void onMessage(WebSocketFrame message, String remoteIPAddress) {
             JSONObject json;
 
             try {
@@ -122,11 +132,11 @@ public class HttpServer extends NanoWSD {
                 return;
             }
 
-            handleRequest(json);
+            handleRequest(json, remoteIPAddress);
         }
 
         @Override
-        protected void onPong(WebSocketFrame pong) {
+        protected void onPong(WebSocketFrame pong, String remoteIPAddress) {
         }
 
         @Override
@@ -137,7 +147,24 @@ public class HttpServer extends NanoWSD {
 
     @Override
     protected WebSocket openWebSocket(IHTTPSession handshake) {
-        webSocket = new Ws(handshake);
+        String remoteIPAddress = handshake.getRemoteIpAddress();
+        if(webSocketMap.containsKey(remoteIPAddress))
+        {
+            Ws webSocket = webSocketMap.get(remoteIPAddress);
+            WebSocketFrame.CloseCode code = WebSocketFrame.CloseCode.NormalClosure;
+            String reason = "";
+            try {
+                webSocket.stopTimer(remoteIPAddress);
+//                webSocket.onClose(code, reason, true, remoteIPAddress);
+                webSocket.close(code, reason, true, remoteIPAddress, false);
+            } catch (IOException e) {
+                Log.d(TAG, "openWebSocket Close Error");
+            }
+            webSocketMap.remove(remoteIPAddress);
+        }
+
+        Ws webSocket = new Ws(handshake);
+        webSocketMap.put(remoteIPAddress, webSocket);
         return webSocket;
     }
 
@@ -150,26 +177,34 @@ public class HttpServer extends NanoWSD {
     }
 
     public interface HttpServerInterface {
-        void onMouseDown(JSONObject message);
-        void onMouseMove(JSONObject message);
-        void onMouseUp(JSONObject message);
-        void onMouseZoomIn(JSONObject message);
-        void onMouseZoomOut(JSONObject message);
-        void onButtonBack();
-        void onButtonHome();
-        void onButtonRecent();
-        void onButtonPower();
-        void onButtonLock();
-        void onJoin(HttpServer server);
-        void onSdp(JSONObject message);
-        void onIceCandidate(JSONObject message);
-        void onBye();
-        void onWebSocketClose();
+        void onMouseDown(JSONObject message, String remoteIPAddress);
+        void onMouseMove(JSONObject message, String remoteIPAddress);
+        void onMouseUp(JSONObject message, String remoteIPAddress);
+        void onMouseZoomIn(JSONObject message, String remoteIPAddress);
+        void onMouseZoomOut(JSONObject message, String remoteIPAddress);
+        void onButtonBack(String remoteIPAddress);
+        void onButtonHome(String remoteIPAddress);
+        void onButtonRecent(String remoteIPAddress);
+        void onButtonPower(String remoteIPAddress);
+        void onButtonLock(String remoteIPAddress);
+        void onJoin(HttpServer server, String remoteIPAddress);
+        void onSdp(JSONObject message, String remoteIPAddress);
+        void onIceCandidate(JSONObject message, String remoteIPAddress);
+        void onBye(String remoteIPAddress);
+        void onWebSocketClose(String remoteIPAddress);
     }
 
-    public void send(String message) throws IOException {
-        if (webSocket != null)
-            webSocket.send(message);
+    public void send(String message, String remoteIPAddress) throws IOException {
+        if(remoteIPAddress == null || remoteIPAddress.isEmpty())
+            return;
+
+        if(webSocketMap.containsKey(remoteIPAddress))
+        {
+            Ws webSocket = webSocketMap.get(remoteIPAddress);
+            if (webSocket != null)
+                webSocket.send(message);
+        }
+
     }
 
     private Response serveRequest(IHTTPSession session, String uri, Method method) {
@@ -204,7 +239,7 @@ public class HttpServer extends NanoWSD {
         return newFixedLengthResponse(Response.Status.OK, MIME_HTML, indexHtml);
     }
 
-    private void handleRequest(JSONObject json) {
+    private void handleRequest(JSONObject json, String remoteIPAddress) {
         String type;
         try {
             type = json.getString(TYPE_PARAM);
@@ -215,46 +250,46 @@ public class HttpServer extends NanoWSD {
 
         switch (type) {
             case TYPE_VALUE_MOUSE_DOWN:
-                httpServerInterface.onMouseDown(json);
+                httpServerInterface.onMouseDown(json, remoteIPAddress);
                 break;
             case TYPE_VALUE_MOUSE_MOVE:
-                httpServerInterface.onMouseMove(json);
+                httpServerInterface.onMouseMove(json, remoteIPAddress);
                 break;
             case TYPE_VALUE_MOUSE_UP:
-                httpServerInterface.onMouseUp(json);
+                httpServerInterface.onMouseUp(json, remoteIPAddress);
                 break;
             case TYPE_VALUE_MOUSE_ZOOM_IN:
-                httpServerInterface.onMouseZoomIn(json);
+                httpServerInterface.onMouseZoomIn(json, remoteIPAddress);
                 break;
             case TYPE_VALUE_MOUSE_ZOOM_OUT:
-                httpServerInterface.onMouseZoomOut(json);
+                httpServerInterface.onMouseZoomOut(json, remoteIPAddress);
                 break;
             case TYPE_VALUE_BUTTON_BACK:
-                httpServerInterface.onButtonBack();
+                httpServerInterface.onButtonBack(remoteIPAddress);
                 break;
             case TYPE_VALUE_BUTTON_HOME:
-                httpServerInterface.onButtonHome();
+                httpServerInterface.onButtonHome(remoteIPAddress);
                 break;
             case TYPE_VALUE_BUTTON_RECENT:
-                httpServerInterface.onButtonRecent();
+                httpServerInterface.onButtonRecent(remoteIPAddress);
                 break;
             case TYPE_VALUE_BUTTON_POWER:
-                httpServerInterface.onButtonPower();
+                httpServerInterface.onButtonPower(remoteIPAddress);
                 break;
             case TYPE_VALUE_BUTTON_LOCK:
-                httpServerInterface.onButtonLock();
+                httpServerInterface.onButtonLock(remoteIPAddress);
                 break;
             case TYPE_VALUE_JOIN:
-                httpServerInterface.onJoin(this);
+                httpServerInterface.onJoin(this, remoteIPAddress);
                 break;
             case TYPE_VALUE_SDP:
-                httpServerInterface.onSdp(json);
+                httpServerInterface.onSdp(json, remoteIPAddress);
                 break;
             case TYPE_VALUE_ICE:
-                httpServerInterface.onIceCandidate(json);
+                httpServerInterface.onIceCandidate(json, remoteIPAddress);
                 break;
             case TYPE_VALUE_BYE:
-                httpServerInterface.onBye();
+                httpServerInterface.onBye(remoteIPAddress);
                 break;
         }
     }

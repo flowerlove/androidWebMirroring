@@ -13,7 +13,7 @@ public class SettingsHelper {
 
     private static final String TAG = SettingsHelper.class.getSimpleName();
 
-    private static final int HTTP_SERVER_PORT_DEFAULT = 8082;
+    private static final int HTTP_SERVER_PORT_DEFAULT = 8083;
     private static final String SETTINGS_NAME_PORT = "port";
     private static final String SETTINGS_NAME_REMOTE_CONTROL = "remote_control";
     private OnSettingsChangeListener onSettingsChangeListener;
